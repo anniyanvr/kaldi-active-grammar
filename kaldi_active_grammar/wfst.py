@@ -4,12 +4,11 @@
 # Licensed under the AGPL-3.0; see LICENSE.txt file.
 #
 
-import collections, itertools, math
+import collections, hashlib, itertools, math
 
 from six import iteritems, itervalues, text_type
 
 from . import KaldiError
-from .utils import FSTFileCache
 
 
 class WFST(object):
@@ -68,7 +67,7 @@ class WFST(object):
         self._arc_table_dict[src_state].append(
             [int(src_state), int(dst_state), text_type(label), text_type(olabel), float(weight)])
 
-    def get_fst_text(self, fst_cache, eps2disambig=False):
+    def get_fst_text(self, eps2disambig=False):
         eps_replacement = self.eps_disambig if eps2disambig else self.eps
         arcs_text = u''.join("%d %d %s %s %f\n" % (
                 src_state,
@@ -84,9 +83,17 @@ class WFST(object):
             )
             for (id, weight) in iteritems(self._state_table)
             if weight != 0)
-        text = arcs_text + states_text
-        self.filename = fst_cache.hash_data(text, mix_dependencies=True) + '.fst'
-        return text
+        return arcs_text + states_text
+
+    def compute_hash(self, dependencies_seed_hash_str='0'*32, eps2disambig=False):
+        if not isinstance(dependencies_seed_hash_str, text_type):
+            dependencies_seed_hash_str = text_type(dependencies_seed_hash_str)
+        hasher = hashlib.md5()
+        hasher.update(dependencies_seed_hash_str.encode('utf-8'))
+        hasher.update(self.get_fst_text(eps2disambig=eps2disambig).encode('utf-8'))
+        hash_str = text_type(hasher.hexdigest())
+        self.filename = hash_str + '.fst'
+        return hash_str
 
     ####################################################################################################################
 
@@ -126,7 +133,11 @@ class WFST(object):
         return False
 
     def does_match(self, target_words, wildcard_nonterms=(), include_silent=False):
-        """ Returns the olabels on a matching path if there is one, False if not. Uses BFS. Wildcard accepts zero or more words. Used for parsing by KaldiAG.compiler. """
+        """Return matching olabels, or False if there is no match.
+
+        Uses BFS and accepts zero or more words for wildcard nonterminals.
+        Currently unused in-package, but retained as a public utility.
+        """
         queue = collections.deque()  # entries: (state, path of olabels of arcs to state, index into target_words of remaining words)
         queue.append((self.start_state, (), 0))
         while queue:
@@ -167,6 +178,7 @@ class NativeWFST(FFIObject):
         DRAGONFLY_API bool fst__destruct(void* fst_vp);
         DRAGONFLY_API int32_t fst__add_state(void* fst_vp, float weight, bool initial);
         DRAGONFLY_API bool fst__add_arc(void* fst_vp, int32_t src_state_id, int32_t dst_state_id, int32_t ilabel, int32_t olabel, float weight);
+        DRAGONFLY_API bool fst__add_arcs(void* fst_vp, int32_t num_arcs, const int32_t src_state_ids_cp[], const int32_t dst_state_ids_cp[], const int32_t ilabels_cp[], const int32_t olabels_cp[], const float weights_cp[]);
         DRAGONFLY_API bool fst__compute_md5(void* fst_vp, char* md5_cp, char* dependencies_seed_md5_cp);
         DRAGONFLY_API bool fst__has_path(void* fst_vp);
         DRAGONFLY_API bool fst__has_eps_path(void* fst_vp, int32_t path_src_state, int32_t path_dst_state);
@@ -184,6 +196,7 @@ class NativeWFST(FFIObject):
     eps_disambig = u'#0'
     silent_words = frozenset((eps, eps_disambig, u'!SIL'))
     native = property(lambda self: True)
+    arc_batch_size = 4096
 
     @classmethod
     def init_class(cls, isymbol_table, wildcard_nonterms, osymbol_table=None):
@@ -211,42 +224,67 @@ class NativeWFST(FFIObject):
         self._construct()
 
     def _construct(self):
-        self.native_obj = self._lib.fst__construct()
-        if self.native_obj == _ffi.NULL:
+        native_obj = self._lib.fst__construct()
+        if native_obj == _ffi.NULL:
             raise KaldiError("Failed fst__construct")
+        self.native_obj = self._own_native(native_obj, self._lib.fst__destruct, 'native WFST')
 
         self.num_states = 1  # Is initialized with a start state
         self.num_arcs = 0
         self.filename = None
         self._compiled_native_obj = None
+        self._reset_pending_arcs()
 
-    def __del__(self):
-        self.destruct()
+    def _reset_pending_arcs(self):
+        self._pending_arc_src_state_ids = []
+        self._pending_arc_dst_state_ids = []
+        self._pending_arc_ilabels = []
+        self._pending_arc_olabels = []
+        self._pending_arc_weights = []
 
-    def destruct(self):
-        del self.compiled_native_obj
-        if self.native_obj is not None:
-            result = self._lib.fst__destruct(self.native_obj)
-            self.native_obj = None
-            if not result:
-                raise KaldiError("Failed fst__destruct on %r" % self.native_obj)
+    def close(self):
+        cleanup_error = None
+        try:
+            del self.compiled_native_obj
+        except Exception as error:
+            cleanup_error = error
+        try:
+            self._release_native('native_obj', self._lib.fst__destruct, 'native WFST')
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        self._reset_pending_arcs()
+        if cleanup_error is not None:
+            raise cleanup_error
 
-    compiled_native_obj = property(lambda self: self._compiled_native_obj)
+    @property
+    def compiled_native_obj(self):
+        return self._get_compiled_native_obj()
+
     @compiled_native_obj.setter
     def compiled_native_obj(self, value):
+        if value is None or value == _ffi.NULL:
+            raise KaldiError("Cannot assign closed compiled native WFST")
+        owned_value = self._own_native(value, self._lib.fst__destruct, 'compiled native WFST')
         del self.compiled_native_obj
-        self._compiled_native_obj = value
+        self._compiled_native_obj = owned_value
     @compiled_native_obj.deleter
     def compiled_native_obj(self):
-        if self._compiled_native_obj is not None:
-            result = self._lib.fst__destruct(self._compiled_native_obj)
-            self._compiled_native_obj = None
-            if not result:
-                raise KaldiError("Failed fst__destruct on %r" % self._compiled_native_obj)
+        self._release_native('_compiled_native_obj', self._lib.fst__destruct, 'compiled native WFST')
 
     def clear(self):
-        self.destruct()
+        self.close()
         self._construct()
+
+    def _get_native_obj(self):
+        self._flush_pending_arcs()
+        return self._get_raw_native_obj()
+
+    def _get_raw_native_obj(self):
+        return self._require_native(getattr(self, 'native_obj', None), 'native WFST')
+
+    def _get_compiled_native_obj(self):
+        return self._require_native(getattr(self, '_compiled_native_obj', None), 'compiled native WFST')
 
     def add_state(self, weight=None, initial=False, final=False):
         """ Default weight is 1. """
@@ -256,7 +294,11 @@ class NativeWFST(FFIObject):
         else:
             assert final
         weight = -math.log(weight) if weight != 0 else self.zero
-        id = self._lib.fst__add_state(self.native_obj, float(weight), bool(initial))
+        # An initial state adds an epsilon arc from state 0 natively. Flush
+        # first so its insertion order remains consistent with scalar builds.
+        if initial:
+            self._flush_pending_arcs()
+        id = self._lib.fst__add_state(self._get_raw_native_obj(), float(weight), bool(initial))
         if id < 0:
             raise KaldiError("Failed fst__add_state")
         self.num_states += 1
@@ -267,20 +309,67 @@ class NativeWFST(FFIObject):
     def add_arc(self, src_state, dst_state, label, olabel=None, weight=None):
         """ Default weight is 1. None label is replaced by eps. Default olabel of None is replaced by label. """
         self.filename = None
+        self._get_raw_native_obj()
         if label is None: label = self.eps
         if olabel is None: olabel = label
         if weight is None: weight = 1
         weight = -math.log(weight) if weight != 0 else self.zero
         label_id = self.word_to_ilabel_map[label]
         olabel_id = self.word_to_olabel_map[olabel]
-        result = self._lib.fst__add_arc(self.native_obj, int(src_state), int(dst_state), int(label_id), int(olabel_id), float(weight))
-        if not result:
-            raise KaldiError("Failed fst__add_arc")
+        self._queue_arc(int(src_state), int(dst_state), int(label_id), int(olabel_id), float(weight))
+
+    def add_arcs(self, arcs):
+        """Add an iterable of ``(src, dst, label[, olabel[, weight]])`` arcs."""
+        self.filename = None
+        self._get_raw_native_obj()
+        word_to_ilabel = self.word_to_ilabel_map
+        word_to_olabel = self.word_to_olabel_map
+
+        for arc in arcs:
+            if not 3 <= len(arc) <= 5:
+                raise ValueError("Each arc must contain 3 to 5 values")
+            src_state, dst_state, label = arc[:3]
+            olabel = arc[3] if len(arc) >= 4 else None
+            weight = arc[4] if len(arc) >= 5 else None
+            if label is None: label = self.eps
+            if olabel is None: olabel = label
+            if weight is None: weight = 1
+
+            self._queue_arc(
+                int(src_state), int(dst_state),
+                int(word_to_ilabel[label]), int(word_to_olabel[olabel]),
+                float(-math.log(weight) if weight != 0 else self.zero))
+
+    def _queue_arc(self, src_state, dst_state, ilabel, olabel, weight):
+        self._pending_arc_src_state_ids.append(src_state)
+        self._pending_arc_dst_state_ids.append(dst_state)
+        self._pending_arc_ilabels.append(ilabel)
+        self._pending_arc_olabels.append(olabel)
+        self._pending_arc_weights.append(weight)
         self.num_arcs += 1
+        if len(self._pending_arc_src_state_ids) >= self.arc_batch_size:
+            self._flush_pending_arcs()
+
+    def _flush_pending_arcs(self):
+        src_state_ids = getattr(self, '_pending_arc_src_state_ids', ())
+        num_arcs = len(src_state_ids)
+        if num_arcs == 0:
+            return
+        result = self._lib.fst__add_arcs(
+            self._get_raw_native_obj(), num_arcs,
+            _ffi.new('int32_t[]', src_state_ids),
+            _ffi.new('int32_t[]', self._pending_arc_dst_state_ids),
+            _ffi.new('int32_t[]', self._pending_arc_ilabels),
+            _ffi.new('int32_t[]', self._pending_arc_olabels),
+            _ffi.new('float[]', self._pending_arc_weights),
+        )
+        if not result:
+            raise KaldiError("Failed fst__add_arcs")
+        self._reset_pending_arcs()
 
     def compute_hash(self, dependencies_seed_hash_str='0'*32):
         hash_p = _ffi.new('char[]', 33)  # Length of MD5 hex string + null terminator
-        result = self._lib.fst__compute_md5(self.native_obj, hash_p, encode(dependencies_seed_hash_str))
+        result = self._lib.fst__compute_md5(self._get_native_obj(), hash_p, encode(dependencies_seed_hash_str))
         if not result:
             raise KaldiError("Failed fst__compute_md5")
         hash_str = decode(_ffi.string(hash_p))
@@ -291,23 +380,28 @@ class NativeWFST(FFIObject):
 
     def has_path(self):
         """ Returns True iff there is a path (from start state to a final state). Uses BFS. Assumes can nonterminals succeed. """
-        result = self._lib.fst__has_path(self.native_obj)
+        result = self._lib.fst__has_path(self._get_native_obj())
         return result
 
     def has_eps_path(self, path_src_state, path_dst_state, eps_like_labels=frozenset()):
         """ Returns True iff there is a epsilon-like-only path from src_state to dst_state. Uses BFS. Does not follow nonterminals! """
         assert not eps_like_labels
-        result = self._lib.fst__has_eps_path(self.native_obj, path_src_state, path_dst_state)
+        result = self._lib.fst__has_eps_path(self._get_native_obj(), path_src_state, path_dst_state)
         return result
 
     def does_match(self, target_words, wildcard_nonterms=(), include_silent=False, output_max_length=1024):
-        """ Returns the olabels on a matching path if there is one, False if not. Uses BFS. Wildcard accepts zero or more words. """
+        """Return matching olabels, or False if there is no match.
+
+        Uses the native BFS implementation and accepts zero or more words for
+        wildcard nonterminals. Currently unused in-package, but retained as a
+        public utility.
+        """
         # FIXME: do in decoder!
         assert frozenset(wildcard_nonterms) == self.wildcard_nonterms
         output_p = _ffi.new('int32_t[]', output_max_length)
         output_len_p = _ffi.new('int32_t*', output_max_length)
         target_labels = [self.word_to_ilabel_map[word] for word in target_words]
-        result = self._lib.fst__does_match(self.native_obj, len(target_labels), target_labels, output_p, output_len_p)
+        result = self._lib.fst__does_match(self._get_native_obj(), len(target_labels), target_labels, output_p, output_len_p)
         if output_len_p[0] > output_max_length:
             raise KaldiError("fst__does_match needed too much output length")
         if result:
@@ -319,17 +413,17 @@ class NativeWFST(FFIObject):
     ####################################################################################################################
 
     def write_file(self, fst_filename):
-        result = self._lib.fst__write_file(self.native_obj, encode(fst_filename))
+        result = self._lib.fst__write_file(self._get_native_obj(), encode(fst_filename))
         if not result:
             raise KaldiError("Failed fst__write_file")
 
     def write_file_const(self, fst_filename):
-        result = self._lib.fst__write_file_const(self.native_obj, encode(fst_filename))
+        result = self._lib.fst__write_file_const(self._get_native_obj(), encode(fst_filename))
         if not result:
             raise KaldiError("Failed fst__write_file")
 
     def print(self, fst_filename=None):
-        result = self._lib.fst__print(self.native_obj, (encode(fst_filename) if fst_filename is not None else _ffi.NULL))
+        result = self._lib.fst__print(self._get_native_obj(), (encode(fst_filename) if fst_filename is not None else _ffi.NULL))
         if not result:
             raise KaldiError("Failed fst__print")
 
@@ -360,17 +454,53 @@ class SymbolTable(object):
         self.word_to_id_map = dict()
         self.id_to_word_map = dict()
         self.max_term_word_id = -1
+        self.longest_word = None
         if filename is not None:
             self.load_text_file(filename)
 
     def load_text_file(self, filename):
+        word_to_id_map = {}
+        longest_word = None
         with open(filename, 'r', encoding='utf-8') as file:
-            word_id_pairs = [line.strip().split() for line in file]
+            for line_number, line in enumerate(file, 1):
+                tokens = line.split()
+                if len(tokens) != 2:
+                    raise ValueError(
+                        "invalid symbol table entry in %r at line %d: expected 2 fields, got %d"
+                        % (filename, line_number, len(tokens)))
+                word, id_text = tokens
+                try:
+                    word_id = int(id_text)
+                except ValueError:
+                    raise ValueError(
+                        "invalid symbol ID in %r at line %d: %r"
+                        % (filename, line_number, id_text))
+                word_to_id_map[word] = word_id
+                if longest_word is None or len(word) > len(longest_word):
+                    longest_word = word
+
+        if not word_to_id_map:
+            raise ValueError("empty symbol table: %r" % filename)
+
+        # Construct this from the completed forward map rather than directly
+        # from file entries. This preserves the existing last-wins behavior
+        # when a table contains duplicate words or IDs.
+        id_to_word_map = { id: word for (word, id) in word_to_id_map.items() }
+        max_term_word_id = max((
+            id for (word, id) in word_to_id_map.items()
+            if not word.startswith('#nonterm')
+        ), default=None)
+        if max_term_word_id is None:
+            raise ValueError("symbol table has no terminal words: %r" % filename)
+
+        # These dictionaries are captured by NativeWFST.init_class(). Preserve
+        # their identity when reloading after a lexicon update.
         self.word_to_id_map.clear()
         self.id_to_word_map.clear()
-        self.word_to_id_map.update({ word: int(id) for (word, id) in word_id_pairs })
-        self.id_to_word_map.update({ id: word for (word, id) in self.word_to_id_map.items() })
-        self.max_term_word_id = max(id for (word, id) in self.word_to_id_map.items() if not word.startswith('#nonterm'))
+        self.word_to_id_map.update(word_to_id_map)
+        self.id_to_word_map.update(id_to_word_map)
+        self.max_term_word_id = max_term_word_id
+        self.longest_word = longest_word
 
     def add_word(self, word, id=None):
         if id is None:

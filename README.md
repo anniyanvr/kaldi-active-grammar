@@ -5,20 +5,25 @@
 > Python package developed to enable context-based command & control of computer applications, as in the [Dragonfly](https://github.com/dictation-toolbox/dragonfly) speech recognition framework, using the [Kaldi](https://github.com/kaldi-asr/kaldi) automatic speech recognition engine.
 
 [![PyPI - Version](https://img.shields.io/pypi/v/kaldi-active-grammar.svg)](https://pypi.python.org/pypi/kaldi-active-grammar/)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/kaldi-active-grammar.svg)](https://pypi.python.org/pypi/kaldi-active-grammar/)
 [![PyPI - Wheel](https://img.shields.io/pypi/wheel/kaldi-active-grammar.svg)](https://pypi.python.org/pypi/kaldi-active-grammar/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/kaldi-active-grammar.svg)](https://pypi.python.org/pypi/kaldi-active-grammar/)
 [![PyPI - Downloads](https://img.shields.io/pypi/dm/kaldi-active-grammar.svg?logo=python)](https://pypi.python.org/pypi/kaldi-active-grammar/)
 [![GitHub - Downloads](https://img.shields.io/github/downloads/daanzu/kaldi-active-grammar/total?logo=github)](https://github.com/daanzu/kaldi-active-grammar/releases)
 <!-- [![GitHub - Downloads](https://img.shields.io/github/downloads/daanzu/kaldi-active-grammar/latest/total?logo=github)](https://github.com/daanzu/kaldi-active-grammar/releases/latest) -->
 
-[![Batteries-Included](https://img.shields.io/badge/batteries-included-green.svg)](https://github.com/daanzu/kaldi-active-grammar/releases)
-![Continuous Integration](https://github.com/daanzu/kaldi-active-grammar/workflows/Continuous%20Integration/badge.svg)
-[![Gitter](https://badges.gitter.im/kaldi-active-grammar/community.svg)](https://gitter.im/kaldi-active-grammar/community)
+![Maintenance](https://img.shields.io/maintenance/yes/2026)
+![PyPI - Status](https://img.shields.io/pypi/status/kaldi-active-grammar)
+[![Build](https://github.com/daanzu/kaldi-active-grammar/actions/workflows/build.yml/badge.svg)](https://github.com/daanzu/kaldi-active-grammar/actions/workflows/build.yml)
+[![PyPI - License](https://img.shields.io/pypi/l/kaldi-active-grammar)](https://github.com/daanzu/kaldi-active-grammar?tab=AGPL-3.0-1-ov-file#readme)
+[![Gitter](https://img.shields.io/gitter/room/daanzu/kaldi-active-grammar)](https://app.gitter.im/#/room/#kaldi-active-grammar_community:gitter.im)
+<!-- [![Gitter](https://badges.gitter.im/kaldi-active-grammar/community.svg)](https://app.gitter.im/#/room/#kaldi-active-grammar_community:gitter.im) -->
+<!-- [![Gitter](https://badges.gitter.im/kaldi-active-grammar/community.svg)](https://app.gitter.im/#/room/#dragonfly2:matrix.org) -->
+<!-- [![Batteries-Included](https://img.shields.io/badge/batteries-included-green.svg)](https://github.com/daanzu/kaldi-active-grammar/releases) -->
+<!-- ![GitHub Sponsors](https://img.shields.io/github/sponsors/daanzu) -->
 
-[![Donate](https://img.shields.io/badge/donate-GitHub-pink.svg)](https://github.com/sponsors/daanzu)
-[![Donate](https://img.shields.io/badge/donate-Patreon-orange.svg)](https://www.patreon.com/daanzu)
-[![Donate](https://img.shields.io/badge/donate-PayPal-green.svg)](https://paypal.me/daanzu)
-[![Donate](https://img.shields.io/badge/preferred-GitHub-black.svg)](https://github.com/sponsors/daanzu)
+[![Donate](https://img.shields.io/badge/donate-GitHub-EA4AAA.svg?logo=githubsponsors)](https://github.com/sponsors/daanzu)
+[![Donate](https://img.shields.io/badge/donate-PayPal-002991.svg?logo=paypal)](https://paypal.me/daanzu)
+[![Donate](https://img.shields.io/badge/donate-GitHub-EA4AAA.svg?logo=githubsponsors)](https://github.com/sponsors/daanzu)
 
 Normally, Kaldi decoding graphs are **monolithic**, require **expensive up-front off-line** compilation, and are **static during decoding**. Kaldi's new grammar framework allows **multiple independent** grammars with nonterminals, to be compiled separately and **stitched together dynamically** at decode-time, but all the grammars are **always active** and capable of being recognized.
 
@@ -30,6 +35,7 @@ See the [Changelog](CHANGELOG.md) for the latest updates.
 
 * **Binaries:** The Python package **includes all necessary binaries** for decoding on **Windows/Linux/MacOS**. Available on [PyPI](https://pypi.org/project/kaldi-active-grammar/#files).
     * Binaries are generated from my [fork of Kaldi](https://github.com/daanzu/kaldi-fork-active-grammar), which is only intended to be used by kaldi-active-grammar directly, and not as a stand-alone library.
+* **Distribution format:** Only platform-specific wheels are produced and supported. Source distributions (`sdist`) are intentionally unsupported because a usable package must contain the matching native Kaldi library.
 * **Pre-trained model:** A compatible **general English Kaldi nnet3 chain model** is trained on **~3000** hours of open audio. Available under [project releases](https://github.com/daanzu/kaldi-active-grammar/releases).
     * [**Model info and comparison**](docs/models.md)
     * Improved models are under development.
@@ -50,10 +56,9 @@ See the [Changelog](CHANGELOG.md) for the latest updates.
 
 ### Donations are appreciated to encourage development.
 
-[![Donate](https://img.shields.io/badge/donate-GitHub-pink.svg)](https://github.com/sponsors/daanzu)
-[![Donate](https://img.shields.io/badge/donate-Patreon-orange.svg)](https://www.patreon.com/daanzu)
-[![Donate](https://img.shields.io/badge/donate-PayPal-green.svg)](https://paypal.me/daanzu)
-[![Donate](https://img.shields.io/badge/preferred-GitHub-black.svg)](https://github.com/sponsors/daanzu)
+[![Donate](https://img.shields.io/badge/donate-GitHub-EA4AAA.svg?logo=githubsponsors)](https://github.com/sponsors/daanzu)
+[![Donate](https://img.shields.io/badge/donate-PayPal-002991.svg?logo=paypal)](https://paypal.me/daanzu)
+[![Donate](https://img.shields.io/badge/donate-GitHub-EA4AAA.svg?logo=githubsponsors)](https://github.com/sponsors/daanzu)
 
 ### Related Repositories
 
@@ -110,29 +115,34 @@ Otherwise...
 
 ## Documentation
 
-Formal documentation is somewhat lacking currently. To see example usage, examine:
+Architecture and usage references:
 
-* [**Plain dictation interface**](examples/plain_dictation.py): Set up recognizer for plain dictation; perform decoding on given `wav` file.
-* [**Full example**](examples/full_example.py): Set up grammar compiler & decoder; set up a rule; perform decoding on live, real-time audio from microphone.
+* [**Kaldi fork architecture and interaction**](docs/kaldi-fork-architecture.md): Multi-level design of the Python/native boundary, grammar compilation, dynamic decoding, build coupling, and operational invariants.
+* [**Building**](BUILDING.md): Source-build workflows and native/Python revision coupling.
+* [**Testing**](TESTING.md): Integration-test setup, framework requirements, and the opt-in prolonged grammar activity test.
+* [**Examples**](examples/): Runnable examples and supporting utilities, including plain dictation, live microphone decoding, mixed command/dictation grammars, and direct text mimicking.
 * [**Backend for Dragonfly**](https://github.com/daanzu/dragonfly/tree/kaldi/dragonfly/engines/backend_kaldi): Many advanced features and complex interactions.
 
-The KaldiAG API is fairly low level, but basically: you define a set of grammar rules, then send in audio data, along with a bit mask of which rules are active at the beginning of each utterance, and receive back the recognized rule and text. The easy way is to go through Dragonfly, which makes it easy to define the rules, contexts, and actions.
+The KaldiAG API is fairly low level, but basically: you define a set of grammar rules, then send in audio data, along with the integer IDs of the rules active at the beginning of each utterance, and receive back the recognized rule and text. Pass `None` on continuation chunks; pass an empty list to explicitly disable all rules. The easy way is to go through Dragonfly, which makes it easy to define the rules, contexts, and actions.
 
-### Building
+Native decoders and graph compilers can hold around a gigabyte of memory. They
+are released automatically when Python garbage-collects their owning objects,
+including reference cycles. For prompt, deterministic release, use `Compiler`,
+`KaldiRule`, `PlainDictationRecognizer`, decoder wrappers, and `NativeWFST` as
+context managers, or call their idempotent `close()` method.
 
-* Recommendation: use the binary wheels distributed for all major platforms.
-    * Significant work has gone into allowing you to avoid the many repo/dependency downloads, GBs of disk space, and vCPU-hours needed for building from scratch.
-    * They are built in public by automated Continuous Integration run on GitHub Actions: [see manifest](.github/workflows/build.yml).
-* Alternatively, to build for use locally:
-    * Linux/MacOS:
-        1. `python -m pip install -r requirements-build.txt`
-        1. `python setup.py bdist_wheel` (see [`CMakeLists.txt`](CMakeLists.txt) for details)
-    * Windows:
-        * Less easily generally automated
-        * You can follow the steps for Continuous Integration run on GitHub Actions: see the `build-windows` section of [the manifest](.github/workflows/build.yml).
-* Note: the project (and python wheel) is built from a duorepo (2 separate repos used together):
-    1. This repo, containing the external interface and higher-level logic, written in Python.
-    1. [My fork of Kaldi](https://github.com/daanzu/kaldi-fork-active-grammar), containing the lower-level code, written in C++.
+```python
+with Compiler() as compiler:
+    decoder = compiler.init_decoder()
+    # compile rules and decode audio
+```
+
+### Building and testing
+
+If at all possible, use the published binary wheels for your platform. Only
+consult [`BUILDING.md`](BUILDING.md) if you cannot use the wheels and need to
+build from source. Contributors can find integration and prolonged test setup
+in [`TESTING.md`](TESTING.md).
 
 ## Contributing
 
@@ -140,10 +150,9 @@ Issues, suggestions, and feature requests are welcome & encouraged. Pull request
 
 Donations are appreciated to encourage development.
 
-[![Donate](https://img.shields.io/badge/donate-GitHub-pink.svg)](https://github.com/sponsors/daanzu)
-[![Donate](https://img.shields.io/badge/donate-Patreon-orange.svg)](https://www.patreon.com/daanzu)
-[![Donate](https://img.shields.io/badge/donate-PayPal-green.svg)](https://paypal.me/daanzu)
-[![Donate](https://img.shields.io/badge/preferred-GitHub-black.svg)](https://github.com/sponsors/daanzu)
+[![Donate](https://img.shields.io/badge/donate-GitHub-EA4AAA.svg?logo=githubsponsors)](https://github.com/sponsors/daanzu)
+[![Donate](https://img.shields.io/badge/donate-PayPal-002991.svg?logo=paypal)](https://paypal.me/daanzu)
+[![Donate](https://img.shields.io/badge/donate-GitHub-EA4AAA.svg?logo=githubsponsors)](https://github.com/sponsors/daanzu)
 
 ## Author
 

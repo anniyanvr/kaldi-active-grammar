@@ -1,0 +1,221 @@
+# Testing Kaldi Active Grammar
+
+The integration tests use a Piper voice to synthesize repeatable 16 kHz audio
+and a compatible Kaldi test model to perform real decoding. From the repository
+root, download those assets and create the test environment with:
+
+```sh
+just setup-tests
+just setup-tests-venv
+```
+
+Run the normal suite with `just test`:
+
+```sh
+just test
+```
+
+The separate-process runners, `just test-separately` and
+`just test-package-separately`, are deprecated. They are retained only for
+historical native-state or isolation diagnosis; the memory leaks that motivated
+them are believed to be fixed. Use `just test` or `just test-package` instead.
+
+If a legacy investigation still requires process isolation, the deprecated
+runners remain available:
+
+```sh
+just test-separately
+just test-package-separately
+```
+
+Grammar integration cases are parameterized for the supported native-FST
+frameworks: direct active grammar (`agf-direct`) and lookahead (`laf`). Every
+case asserts that compiler-managed rules use `NativeWFST`. LAF cases require
+`HCLr.fst`, `Gr.fst`, `disambig_tid.int`, `relabel_ilabels.int`, and
+`words.relabeled.txt` in `tests/kaldi_model`; pytest reports a skip naming any
+missing files.
+
+## Prolonged grammar activity test
+
+`test_prolonged_changing_rule_activity` models an extended application session
+in which one compiler and decoder remain alive while grammar context changes
+between utterances. It:
+
+* compiles and loads 24 independent command rules;
+* synthesizes each command once, keeping speech input stable across repetitions;
+* processes 1,000 utterances per framework without recreating the decoder;
+* rotates the target across every rule with a coprime stride; and
+* changes the active set on every utterance, cycling from one active rule to all
+  24 rules.
+
+This coverage is intended to expose failures that short tests may miss, such as
+state leaking between utterances, stale activity, rule-ID handling errors,
+framework-specific graph reconstruction problems, and failures that emerge
+only after repeated decoding. It is marked `prolonged` and excluded by the
+default pytest configuration because both framework cases perform substantial
+real speech decoding.
+
+Run both framework cases explicitly with:
+
+```sh
+just test -m prolonged tests/test_grammar.py::TestGrammar::test_prolonged_changing_rule_activity
+```
+
+Run only one framework by selecting its parameter ID. Quote the node ID so
+shells do not interpret the square brackets:
+
+```sh
+just test -m prolonged 'tests/test_grammar.py::TestGrammar::test_prolonged_changing_rule_activity[agf]'
+just test -m prolonged 'tests/test_grammar.py::TestGrammar::test_prolonged_changing_rule_activity[laf]'
+```
+
+The test pre-generates only 24 audio samples, so most of its runtime is spent in
+the decoder workload. Runtime varies with the platform, model, native build,
+and framework; the LAF case also reconstructs its active decode graph at each
+utterance boundary.
+
+## Long-term stress harness
+
+`tests/stress/longterm.py` models extended power-user sessions far beyond the
+prolonged test above: one compiler and decoder stay alive while many grammars
+(groups of rules, including dictation-bearing rules) are decoded against with
+per-utterance activity changes, and are periodically closed and recreated
+(exercising rule-ID recycling, FileCache-hit recompilation, and the lazy
+compile/load queues), and reloaded in place via `KaldiRule.reload()`. Resource
+metrics are sampled at checkpoints after `gc.collect()` and `malloc_trim`:
+cross-platform process RSS/HWM and file-descriptor or Windows handle counts
+(via `psutil`), thread count, Python object count, live rule and decoder grammar
+counts, and tmp-dir/cache disk usage. Per-utterance latency is recorded
+throughout. A gated run fails explicitly if required process metrics are not
+available; `--allow-missing-process-metrics` is available for diagnostic-only
+environments.
+
+Because the workload asserts that every utterance is won by its own rule, the
+phrases in play have to be acoustically separable under the test model and
+voice. Before the population is built, the harness screens them: each phrase
+in the pool is decoded with every other pool phrase simultaneously active —
+strictly harder than anything the run itself presents, since extra competitors
+can only take probability away from the right answer — and any phrase that
+loses is swapped for an unused one from the universe, repeating until a round
+comes back clean. The result is cached in `phrase_screen.json` beside the
+model, keyed on the model, voice, phrase universe, and population size but
+deliberately *not* on the package version, so a `--baseline-json` comparison
+runs the identical workload on both sides. Use `--rescreen-phrases` to
+recompute, `--skip-phrase-screen` to bypass it, and `--max-screen-rounds` to
+change how long it keeps trying; the `phrase-screen` verdict fails if phrases
+remain unseparated. At the `overnight` population the screen takes about two
+minutes on first run and replaces two phrases.
+
+Recognition results are then gated in two parts, because they fail for two
+different reasons. The `harness-invariants` verdict covers what must hold
+however good or bad the acoustic model is — garbage audio and inactive rules
+must be rejected, and the parsed word/dictation alignment must match the rule
+that won — along with harness and teardown errors; its threshold is zero.
+The `recognition-accuracy` verdict covers one active rule losing to another,
+which is a property of the model and the phrase set rather than of the package;
+it gets a whole-run budget set by `--max-misrecognition-rate` (0.1% of the
+planned utterances by default, so 0 for `smoke`, 5 for `standard`, and 200 for
+`overnight`). Both appear in the summary table and in `failed_verdicts`, and
+every entry in the report's `failures` list carries a matching `category`.
+Exceeding either aborts the run, though never before `--max-failures` examples
+have been logged.
+
+A run fails on incomplete workload, or (unless
+`--observe`) within-run drift after a discarded warmup window: RSS growth slope
+(with a noise floor, since decode-graph working sets wobble), descriptor/handle
+growth, Python object growth slope, p95 latency drift (last vs first
+post-warmup quarter), RSS failing to return to the post-build baseline after
+all rules are closed, or rules failing to release at teardown. Truncation due
+to the workload time cap fails the completion gate by default; use
+`--allow-truncated` only when a deliberately partial run should pass.
+
+Unexpected setup, compile, decode, and teardown exceptions still trigger
+best-effort cleanup and JSON report generation before being re-raised. Both
+`--framework both` and the pytest wrappers run every framework case in a fresh
+subprocess so allocator state cannot contaminate another measurement.
+
+For performance regression gating, `--max-p95-ms`,
+`--max-real-time-factor`, and `--max-prepare-seconds` provide absolute limits.
+`--baseline-json` compares p95 latency, real-time factor, and preparation time
+with a compatible prior report; `--max-baseline-regression-pct`
+controls the allowed increase (25% by default). With `--framework both`, pass
+the common baseline stem and the runner selects the corresponding
+`-agf-direct.json` and `-laf.json` reports.
+
+Run it directly for full knob control (population size, utterance count or
+wall-clock cap, activity pattern, churn/reload cadence, utterance mix, seed,
+thresholds — see `--help`):
+
+```sh
+just stress --profile smoke --framework both
+just stress --profile standard --framework agf --json-out report.json
+just stress --profile standard --framework agf --baseline-json baseline.json --max-baseline-regression-pct 15
+just stress --profile standard --framework agf --max-p95-ms 500 --max-real-time-factor 0.5
+just stress --profile overnight --framework laf --max-minutes 480 --observe
+```
+
+Or as scripted regression tests through pytest (marked `stress`, excluded by
+default; JSON reports land in `tests/.stress_reports/`):
+
+```sh
+just test -m stress                # smoke + standard, both frameworks
+just test -m stress -k 'smoke'     # quick harness validation only
+```
+
+The `standard` profile (12 grammars × 8 rules, 5,000 utterances with churn
+every 250, roughly ten minutes per healthy framework) is the intended
+regression gate; `smoke` is a minutes-scale end-to-end check; `overnight`
+(24 × 10, 200,000 utterances) is for soak testing. Every profile carries a
+`--max-minutes` measured-workload cap. A truncated run still reports and runs
+all available gates, but it fails completion unless explicitly allowed.
+
+### Running against a released wheel
+
+The same workload can run against a published release, to compare current work
+with what users actually have. `just stress-release` provisions an isolated,
+project-free environment holding only that wheel (which bundles its own native
+library, so no fork build is involved) and runs the harness against it:
+
+```sh
+just stress-release 3.2.0 --profile standard --json-out v3.2.0.json --observe
+just stress --profile standard --framework agf --lazy-fraction 1 --baseline-json v3.2.0.json --observe
+```
+
+`tests/stress/compat.py` bridges the API differences (rule closing, compiler
+teardown, rule-ID accounting, and the released positional activity mask); it is
+the only part of the harness that knows about older releases and is meant to be
+deleted once the oldest supported release carries the current API. The report's
+`environment.package_version` records which package produced it, and a
+cross-version `--baseline-json` comparison says so in its verdict detail.
+
+Constraints and caveats:
+
+- **AGF only, v3.0.0 and later.** Released LAF predates the ActiveReplaceFst
+  rework and is refused rather than measured; `--decode-mode mimic` needs a
+  decoder API newer than v3.2.0. Both are reported as explicit skips or errors.
+- **Released runs need a uniform `--lazy-fraction` (1 or 0).** Before rule ids
+  became stable they doubled as the decoder's grammar-fst index, so rules had to
+  reach the decoder in creation order; interleaving lazy and eager rules trips an
+  assertion while the population is built. The harness refuses the mix up front,
+  and `just stress-release` passes `--lazy-fraction 1` by default. Because
+  `lazy_fraction` is part of the baseline compatibility check, the run being
+  compared must pass the same value — otherwise the `baseline-compatible`
+  verdict fails and names the mismatch.
+- **Prefer `--observe` for release runs.** The drift and correctness gates
+  describe current expectations; an old wheel failing them is a finding to read,
+  not a broken run.
+- **Cross-version performance deltas include build noise.** The released native
+  library came from CI with different flags than a local fork build, so treat
+  `--max-baseline-regression-pct` results as a coarse signal.
+- **The phrase screen is shared, not repeated per version.** Its cache key
+  excludes the package version precisely so both sides of a comparison draw on
+  the same screened pool; whichever run happens first computes it. A phrase
+  that only the older decoder confuses therefore reaches the run, where the
+  budgeted `recognition-accuracy` verdict absorbs it. Pass `--model-dir` to
+  screen each version separately if that matters for a particular comparison.
+- **Switching versions invalidates the model's `file_cache.json`** (it is keyed
+  on the package version), so the first run after a switch pays a full lexicon
+  and AGF rebuild during setup. This happens before the measured workload and
+  before the `built` baseline sample, so it does not distort results, but it does
+  make startup slow. Pass `--model-dir` with a separate copy of the model to
+  keep each version's cache warm — at the cost of a full model copy per version.

@@ -5,9 +5,11 @@
 #
 
 import logging, sys, time
-import fnmatch, glob, os
+import fnmatch, os
 import functools
 import hashlib, json
+import stat
+import tempfile
 import threading
 from contextlib import contextmanager
 from io import open
@@ -70,6 +72,30 @@ if not PY2:
 else:
     def clock():
         return time.clock()
+
+def _atomic_write_text(filename, write_func, prefix='.atomic.', suffix='.tmp'):
+    """Write text through a same-directory temporary file and replace atomically."""
+    directory = os.path.dirname(os.path.abspath(filename)) or os.curdir
+    fd, temporary_filename = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+    try:
+        file = os.fdopen(fd, 'w', encoding='utf-8', newline='\n')
+        fd = None
+        with file:
+            write_func(file)
+        replace = getattr(os, 'replace', os.rename)
+        replace(temporary_filename, filename)
+        temporary_filename = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temporary_filename is not None:
+            try:
+                os.remove(temporary_filename)
+            except OSError:
+                pass
 
 
 ########################################################################################################################
@@ -169,6 +195,12 @@ def clear_file(filename):
 
 symbol_table_lookup_cache = dict()
 
+def _symbol_table_value(value):
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
 def symbol_table_lookup(filename, input):
     """
     Returns the RHS corresponding to LHS == ``input`` in symbol table in ``filename``.
@@ -178,15 +210,43 @@ def symbol_table_lookup(filename, input):
         return cached
     with open(filename, 'r', encoding='utf-8') as f:
         for line in f:
-            tokens = line.strip().split()
-            if len(tokens) >= 2 and input == tokens[0]:
-                try:
-                    symbol_table_lookup_cache[(filename, input)] = int(tokens[1])
-                    return int(tokens[1])
-                except Exception as e:
-                    symbol_table_lookup_cache[(filename, input)] = tokens[1]
-                    return tokens[1]
+            if not line.startswith(input):
+                continue
+            remainder = line[len(input):]
+            if not remainder or not remainder[0].isspace():
+                continue
+            tokens = remainder.split()
+            if tokens:
+                value = _symbol_table_value(tokens[0])
+                symbol_table_lookup_cache[(filename, input)] = value
+                return value
         return None
+
+def symbol_table_lookup_many(filename, inputs):
+    """Return symbol-table values for multiple names after at most one file scan."""
+    inputs = tuple(inputs)
+    results = {}
+    remaining = set(inputs)
+    for input in inputs:
+        cached = symbol_table_lookup_cache.get((filename, input))
+        if cached is not None:
+            results[input] = cached
+            remaining.discard(input)
+
+    if remaining:
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line in f:
+                tokens = line.split()
+                if len(tokens) >= 2 and tokens[0] in remaining:
+                    input = tokens[0]
+                    value = _symbol_table_value(tokens[1])
+                    symbol_table_lookup_cache[(filename, input)] = value
+                    results[input] = value
+                    remaining.remove(input)
+                    if not remaining:
+                        break
+
+    return {input: results.get(input) for input in inputs}
 
 def load_symbol_table(filename):
     with open(filename, 'r', encoding='utf-8') as f:
@@ -219,92 +279,456 @@ def is_file_up_to_date(filename, *parent_filenames):
 
 ########################################################################################################################
 
-class FSTFileCache(object):
+class _FSTFileCache(object):
 
-    def __init__(self, cache_filename, tmp_dir=None, dependencies_dict=None, invalidate=False):
+    SCHEMA_VERSION = 2
+    HASH_BLOCK_SIZE = 1024 * 1024
+
+    def __init__(self, cache_filename, tmp_dir=None, dependencies_dict=None,
+            invalidate=False, strict_content_validation=False,
+            defer_initial_save=False):
         """
-        Stores mapping filename -> hash of its contents/data, to detect when recalculaion is necessary. Assumes file is in model_dir.
-        Also stores an entry ``dependencies_list`` listing filenames of all dependencies.
-        FST files are a special case: they aren't stored in the cache object, because their filename is itself a hash of its content mixed with a hash of its dependencies.
-        If ``invalidate``, then initialize a fresh cache.
+        Stores dependency content hashes and metadata to detect when recalculation
+        is necessary. Dependency identities are paths relative to the cache
+        directory whenever possible, never basenames.
+
+        Normal validation trusts a matching size and ``mtime_ns``. A replacement
+        that preserves both values is outside that mode's guarantee; set
+        ``strict_content_validation`` to hash every dependency instead.
+
+        FST files are a special case: they aren't stored in the cache object,
+        because their filename is itself a hash of its content mixed with a
+        hash of its dependencies. If ``invalidate``, discard the loaded state
+        and mark the cache new for the owning Model to rebuild. The private
+        ``defer_initial_save`` mode applies to that reset alone: it writes a
+        cold marker on disk until the rebuild completes successfully. A cache
+        that loaded warm is never marked, so a later failure in the owning
+        Model cannot discard it.
         """
 
         self.cache_filename = cache_filename
+        self.cache_dir = self._canonical_path(os.path.dirname(os.path.abspath(cache_filename)) or os.curdir)
         self.tmp_dir = tmp_dir
         if dependencies_dict is None: dependencies_dict = dict()
         self.dependencies_dict = dependencies_dict
-        self.lock = threading.Lock()
+        self.strict_content_validation = bool(strict_content_validation)
+        self._saves_deferred = False
+        self._dependency_specs = self._make_dependency_specs()
+        self._initial_validation = dict()
 
         try:
             self._load()
         except Exception as e:
             _log.info("%s: failed to load cache from %r", self, cache_filename)
-            self.cache = None
+            self._state = None
 
         must_reset_cache = False
         if invalidate:
             _log.debug("%s: forced invalidate", self)
             must_reset_cache = True
-        elif self.cache is None:
+        elif self._state is None:
             _log.debug("%s: could not load cache", self)
             must_reset_cache = True
-        elif self.cache.get('version') != __version__:
+        elif self._state.get('incomplete'):
+            _log.debug("%s: previous initialization did not complete", self)
+            must_reset_cache = True
+        elif self._state.get('schema_version') != self.SCHEMA_VERSION:
+            _log.debug("%s: cache schema changed or is legacy", self)
+            must_reset_cache = True
+        elif self._state.get('version') != __version__:
             _log.debug("%s: version changed", self)
             must_reset_cache = True
-        elif sorted(self.cache.get('dependencies_list', list())) != sorted(dependencies_dict.keys()):
+        elif self._dependency_ids() != self._expected_dependency_ids():
             _log.debug("%s: list of dependencies has changed", self)
             must_reset_cache = True
-        elif any(not self.file_is_current(path)
-                for (name, path) in dependencies_dict.items()
-                if path and os.path.isfile(path)):
+        elif self._stored_dependencies_hash() != self._compute_dependencies_hash(
+                self._state.get('dependency_ids', []), self._state.get('records', {})):
+            _log.debug("%s: stored dependency hash is inconsistent", self)
+            must_reset_cache = True
+        elif not self._validate_dependencies():
             _log.debug("%s: any of the dependencies files' contents (as stored in cache) has changed", self)
             must_reset_cache = True
 
         if must_reset_cache:
             # Then reset cache
             _log.info("%s: version or dependencies did not match cache from %r; initializing empty", self, cache_filename)
-            self.cache = dict({ 'version': text_type(__version__) })
+            self._state = self._empty_state()
             self.cache_is_new = True
+            if defer_initial_save:
+                # Leave a cold marker on disk while the owning Model performs
+                # its generation transaction.  A failed generation must not
+                # leave the previous cache looking warm on the next startup.
+                self._state['incomplete'] = True
+                self.dirty = True
+                self.save()
+                self._state.pop('incomplete', None)
             self.update_dependencies()
+            if not defer_initial_save:
+                self.save()
+        elif self.dirty:
+            # A valid content digest with changed metadata is still current, but
+            # persist the refreshed metadata for the next stat-only startup.
             self.save()
+
+        # Constructor validation is only reused by internal cache rebuilding;
+        # discard it once initialization is complete.
+        self._initial_validation.clear()
+
+    @contextmanager
+    def _transaction(self):
+        """Defer cache commits until the owning initialization succeeds.
+
+        This withholds saves only; it does not mark the on-disk cache cold.
+        Only a reset under ``defer_initial_save`` does that, so a failed
+        transaction over a cache that loaded warm leaves that warm file intact.
+        """
+        if self._saves_deferred:
+            raise RuntimeError("cache transactions cannot be nested")
+        self._saves_deferred = True
+        committed = False
+        try:
+            yield
+            committed = True
+        finally:
+            self._saves_deferred = False
+            if committed and self.dirty:
+                self._save()
 
     def _load(self):
         with open(self.cache_filename, 'r', encoding='utf-8') as f:
-            self.cache = json.load(f)
+            loaded_state = json.load(f)
+        self._validate_loaded_state(loaded_state)
+        self._state = {
+            field: loaded_state[field]
+            for field in ('schema_version', 'version', 'dependency_ids', 'records', 'dependencies_hash')
+            if field in loaded_state
+        }
+        if loaded_state.get('incomplete'):
+            self._state['incomplete'] = True
         self.cache_is_new = False
-        self.dirty = False
+        self.dirty = set(loaded_state) != {
+            'schema_version', 'version', 'dependency_ids', 'records', 'dependencies_hash'
+        }
 
-    dependencies_hash = property(lambda self: self.cache['dependencies_hash'])
+    @staticmethod
+    def _validate_loaded_state(loaded_state):
+        if not isinstance(loaded_state, dict):
+            raise ValueError("cache state must be a JSON object")
+        schema_version = loaded_state.get('schema_version')
+        if (schema_version is not None and
+                (isinstance(schema_version, bool) or
+                 not isinstance(schema_version, six.integer_types))):
+            raise ValueError("cache schema_version must be an integer")
+        version = loaded_state.get('version')
+        if version is not None:
+            _FSTFileCache._validate_text(version, "cache version")
+        dependency_ids = loaded_state.get('dependency_ids', [])
+        if (not isinstance(dependency_ids, list) or
+                any(not isinstance(identity, text_type) for identity in dependency_ids)):
+            raise ValueError("cache dependency_ids must be a list of text identities")
+        for identity in dependency_ids:
+            _FSTFileCache._validate_text(identity, "cache dependency identity")
+        if ('incomplete' in loaded_state and
+                not isinstance(loaded_state['incomplete'], bool)):
+            raise ValueError("cache incomplete marker must be boolean")
+        if 'dependencies_hash' in loaded_state:
+            dependencies_hash = loaded_state['dependencies_hash']
+            if not (loaded_state.get('incomplete') and dependencies_hash == ''):
+                _FSTFileCache._validate_digest(dependencies_hash, "cache dependencies_hash")
+
+        records = loaded_state.get('records', {})
+        if not isinstance(records, dict):
+            raise ValueError("cache records must be an object")
+        for identity, record in records.items():
+            if not isinstance(identity, text_type) or not isinstance(record, dict):
+                raise ValueError("cache records must map text identities to objects")
+            _FSTFileCache._validate_text(identity, "cache record identity")
+            if record.get('absent') is True:
+                if set(record) != {'absent'}:
+                    raise ValueError("absent cache records cannot contain other fields")
+                continue
+            if set(record) != {'digest', 'size', 'mtime_ns'}:
+                raise ValueError("cache records have invalid fields")
+            _FSTFileCache._validate_digest(record['digest'], "cache record digest")
+            for field in ('size', 'mtime_ns'):
+                value = record[field]
+                if (isinstance(value, bool) or
+                        not isinstance(value, six.integer_types)):
+                    raise ValueError("cache record metadata must be integers")
+
+    @staticmethod
+    def _validate_text(value, description):
+        if not isinstance(value, text_type):
+            raise ValueError("%s must be text" % description)
+        try:
+            value.encode('utf-8')
+        except UnicodeEncodeError:
+            raise ValueError("%s must be valid UTF-8" % description)
+
+    @staticmethod
+    def _validate_digest(value, description):
+        if (not isinstance(value, text_type) or len(value) != 32 or
+                any(character not in '0123456789abcdef' for character in value)):
+            raise ValueError("%s must be a lowercase MD5 digest" % description)
+
+    @staticmethod
+    def _canonical_path(filepath):
+        """Return the runtime identity used for lookup and deduplication."""
+        return os.path.normcase(os.path.realpath(os.path.abspath(filepath)))
+
+    def _persisted_identity(self, filepath):
+        """Return a stable identity relative to the cache directory."""
+        canonical = self._canonical_path(filepath)
+        try:
+            relative = os.path.relpath(canonical, self.cache_dir)
+        except ValueError:
+            # On Windows, relpath() raises for paths on different drives.
+            identity = canonical
+        else:
+            parent = os.pardir
+            if relative == parent or relative.startswith(parent + os.sep):
+                identity = canonical
+            else:
+                identity = relative
+        identity = os.path.normcase(identity)
+        identity = identity.replace(os.sep, '/')
+        if os.altsep:
+            identity = identity.replace(os.altsep, '/')
+        return identity
+
+    def _make_dependency_specs(self):
+        """Build one dependency spec per physical runtime path."""
+        specs = []
+        seen_runtime_paths = set()
+        for name, filepath in sorted(self.dependencies_dict.items(), key=lambda item: text_type(item[0])):
+            if filepath is None:
+                # None is an explicitly absent optional dependency, not a path.
+                continue
+            runtime_path = self._canonical_path(filepath)
+            if runtime_path in seen_runtime_paths:
+                continue
+            seen_runtime_paths.add(runtime_path)
+            specs.append({
+                'name': text_type(name),
+                'path': filepath,
+                'runtime_path': runtime_path,
+                'identity': self._persisted_identity(filepath),
+            })
+        return specs
+
+    def _expected_dependency_ids(self):
+        return sorted(set(spec['identity'] for spec in self._dependency_specs))
+
+    def _dependency_ids(self):
+        return sorted(set(self._state.get('dependency_ids', [])))
+
+    def _stored_dependencies_hash(self):
+        return self._state.get('dependencies_hash')
+
+    def _empty_state(self):
+        return {
+            'schema_version': self.SCHEMA_VERSION,
+            'version': text_type(__version__),
+            'dependency_ids': [],
+            'records': {},
+            'dependencies_hash': '',
+        }
+
+    @staticmethod
+    def _stat_metadata(stat_result):
+        mtime_ns = getattr(stat_result, 'st_mtime_ns', None)
+        if mtime_ns is None:
+            mtime_ns = int(stat_result.st_mtime * 1000000000)
+        return int(stat_result.st_size), int(mtime_ns)
+
+    def _stat_file(self, filepath):
+        try:
+            stat_result = os.stat(filepath)
+        except OSError:
+            return None, None
+        return stat_result, self._stat_metadata(stat_result)
+
+    def _hash_file(self, filepath):
+        """Hash a file without loading the whole file into memory."""
+        hasher = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            while True:
+                block = f.read(self.HASH_BLOCK_SIZE)
+                if not block:
+                    break
+                hasher.update(block)
+        return text_type(hasher.hexdigest())
+
+    def _hash_file_safely(self, filepath, before_metadata):
+        """Hash a stable snapshot, rejecting a file changed during the read."""
+        digest = self._hash_file(filepath)
+        after_stat, after_metadata = self._stat_file(filepath)
+        if after_stat is None or after_metadata != before_metadata:
+            return None, False, after_metadata
+        return digest, True, after_metadata
+
+    def _compute_dependencies_hash(self, dependency_ids, records):
+        pairs = []
+        for identity in sorted(set(dependency_ids)):
+            record = records.get(identity)
+            digest = record.get('digest') if isinstance(record, dict) else None
+            pairs.append((identity, digest))
+        serialized = json.dumps(pairs, ensure_ascii=False, separators=(',', ':'))
+        return self.hash_data(serialized)
+
+    def _validate_dependency(self, spec, memo=None):
+        runtime_path = spec['runtime_path']
+        if memo is not None and runtime_path in memo:
+            return memo[runtime_path]
+
+        record = self._state.get('records', {}).get(spec['identity'])
+        result = {
+            'spec': spec,
+            'current': False,
+            'regular': False,
+            'metadata': None,
+            'digest': None,
+            'stable': True,
+        }
+
+        # A fresh cache intentionally reports its dependency files as stale to
+        # preserve Model's regeneration path.
+        if self.cache_is_new and spec['identity'] in self._state.get('dependency_ids', []):
+            result['current'] = False
+            if memo is not None:
+                memo[runtime_path] = result
+            return result
+
+        stat_result, metadata = self._stat_file(spec['path'])
+        result['metadata'] = metadata
+        if stat_result is None:
+            result['current'] = bool(
+                isinstance(record, dict) and record.get('absent'))
+            if memo is not None:
+                memo[runtime_path] = result
+            return result
+        if not stat.S_ISREG(stat_result.st_mode):
+            # Directory entries are intentionally tracked by identity but have
+            # no content record and never trigger an open/hash operation.
+            result['current'] = True
+            if memo is not None:
+                memo[runtime_path] = result
+            return result
+        result['regular'] = True
+
+        recorded_digest = record.get('digest') if isinstance(record, dict) else None
+        recorded_metadata = (
+            (record.get('size'), record.get('mtime_ns'))
+            if recorded_digest else None)
+        if (recorded_digest and not self.strict_content_validation and
+                recorded_metadata == metadata):
+            result['current'] = True
+            result['digest'] = recorded_digest
+            if memo is not None:
+                memo[runtime_path] = result
+            return result
+
+        digest, stable, final_metadata = self._hash_file_safely(spec['path'], metadata)
+        result['metadata'] = final_metadata or metadata
+        result['digest'] = digest
+        result['stable'] = stable
+        result['current'] = bool(
+            recorded_digest and stable and digest == recorded_digest)
+        if result['current'] and result['metadata'] is not None:
+            if recorded_metadata != result['metadata']:
+                record['size'], record['mtime_ns'] = result['metadata']
+                self.dirty = True
+        if memo is not None:
+            memo[runtime_path] = result
+        return result
+
+    def _validate_dependencies(self):
+        self._initial_validation = dict()
+        all_current = True
+        for spec in self._dependency_specs:
+            result = self._validate_dependency(spec, self._initial_validation)
+            if not result['current']:
+                all_current = False
+        return all_current
+
+    dependencies_hash = property(lambda self: self._state['dependencies_hash'])
 
     def save(self):
-        with open(self.cache_filename, 'w', encoding='utf-8') as f:
-            # https://stackoverflow.com/a/14870531
-            f.write(json.dumps(self.cache, ensure_ascii=False))
+        if self._saves_deferred:
+            _log.debug("%s: deferring cache save until transaction completes", self)
+            return
+        self._save()
+
+    def _save(self):
+        _atomic_write_text(
+            self.cache_filename,
+            lambda file: file.write(json.dumps(self._state, ensure_ascii=False)),
+            prefix='.file_cache.', suffix='.tmp')
         self.dirty = False
 
     def update_dependencies(self):
-        dependencies_dict = self.dependencies_dict
-        for (name, path) in dependencies_dict.items():
-            if path and os.path.isfile(path):
-                self.add_file(path)
-        self.cache['dependencies_list'] = sorted(dependencies_dict.keys())  # list
-        self.cache['dependencies_hash'] = self.hash_data([self.cache.get(path) for (key, path) in sorted(dependencies_dict.items())])
+        old_records = self._state.get('records', {})
+        records = {}
+        for spec in self._dependency_specs:
+            result = self._initial_validation.pop(spec['runtime_path'], None)
+            if result is None:
+                result = self._validate_dependency_for_update(spec, old_records.get(spec['identity']))
+            if result['regular'] and result['stable'] and result['digest']:
+                size, mtime_ns = result['metadata']
+                records[spec['identity']] = {
+                    'digest': result['digest'],
+                    'size': size,
+                    'mtime_ns': mtime_ns,
+                }
+            elif result['metadata'] is None:
+                # Absence is a dependency state. Persist it so an optional
+                # file that remains missing does not reset the cache forever.
+                records[spec['identity']] = {'absent': True}
 
-    def invalidate(self, filename=None):
-        if filename is None:
-            _log.info("%s: invalidating all file entries in cache", self)
-            # Does not invalidate dependencies!
-            self.cache = { key: self.cache[key]
-                for key in ['version', 'dependencies_list', 'dependencies_hash'] + self.cache['dependencies_list']
-                if key in self.cache }
-            self.dirty = True
-            if self.tmp_dir is not None:
-                for filename in glob.glob(os.path.join(self.tmp_dir, '*.fst')):
-                    os.remove(filename)
-        elif filename in self.cache:
-            _log.info("%s: invalidating cache entry for %r", self, filename)
-            del self.cache[filename]
-            self.dirty = True
+        dependency_ids = self._expected_dependency_ids()
+        new_hash = self._compute_dependencies_hash(dependency_ids, records)
+        self._state['schema_version'] = self.SCHEMA_VERSION
+        self._state['version'] = text_type(__version__)
+        self._state['dependency_ids'] = dependency_ids
+        self._state['records'] = records
+        self._state['dependencies_hash'] = new_hash
+        self.dirty = True
+
+    def _validate_dependency_for_update(self, spec, old_record):
+        """Validate a dependency while rebuilding without duplicate hashing."""
+        result = {
+            'spec': spec,
+            'current': False,
+            'regular': False,
+            'metadata': None,
+            'digest': None,
+            'stable': True,
+        }
+        stat_result, metadata = self._stat_file(spec['path'])
+        result['metadata'] = metadata
+        if stat_result is None:
+            result['current'] = bool(
+                isinstance(old_record, dict) and old_record.get('absent'))
+            return result
+        if not stat.S_ISREG(stat_result.st_mode):
+            result['current'] = True
+            return result
+        result['regular'] = True
+
+        if (not self.cache_is_new and isinstance(old_record, dict) and
+                old_record.get('digest') and
+                not self.strict_content_validation and
+                (old_record.get('size'), old_record.get('mtime_ns')) == metadata):
+            result['current'] = True
+            result['digest'] = old_record['digest']
+            return result
+
+        digest, stable, final_metadata = self._hash_file_safely(spec['path'], metadata)
+        result['metadata'] = final_metadata or metadata
+        result['digest'] = digest
+        result['stable'] = stable
+        result['current'] = stable
+        return result
 
     def hash_data(self, data, mix_dependencies=False):
         if not isinstance(data, binary_type):
@@ -316,30 +740,6 @@ class FSTFileCache(object):
             hasher.update(self.dependencies_hash.encode('utf-8'))
         hasher.update(data)
         return text_type(hasher.hexdigest())
-
-    def add_file(self, filepath, data=None):
-        # Assumes file is a root dependency
-        if data is None:
-            with open(filepath, 'rb') as f:
-                data = f.read()
-        filename = os.path.basename(filepath)
-        self.cache[filename] = self.hash_data(data)
-        self.dirty = True
-
-    def contains(self, filename, data):
-        return (filename in self.cache) and (self.cache[filename] == self.hash_data(data))
-
-    def file_is_current(self, filepath, data=None):
-        """Returns bool whether generic filepath file exists and the cache contains the given data (or the file's current data if none given)."""
-        filename = os.path.basename(filepath)
-        if self.cache_is_new and filename in self.cache.get('dependencies_list', list()):
-            return False
-        if not os.path.isfile(filepath):
-            return False
-        if data is None:
-            with open(filepath, 'rb') as f:
-                data = f.read()
-        return self.contains(filename, data)
 
     def fst_is_current(self, filepath, touch=True):
         """Returns bool whether FST file in directory path exists."""

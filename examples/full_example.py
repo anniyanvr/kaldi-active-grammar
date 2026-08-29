@@ -7,8 +7,8 @@ tmp_dir = None  # Default
 
 ##### Set up grammar compiler & decoder
 
+# Pass invalidate=True to regenerate the lexicon and discard cached grammar FSTs.
 compiler = kaldi_active_grammar.Compiler(model_dir=model_dir, tmp_dir=tmp_dir)
-# compiler.fst_cache.invalidate()
 decoder = compiler.init_decoder()
 
 ##### Set up a rule
@@ -52,7 +52,7 @@ for block in audio_iterator:
     elif block is not None:
         if not in_phrase:
             # Start of phrase
-            kaldi_rules_activity = [True]  # A bool for each rule
+            kaldi_rules_activity = [rule.id]  # IDs of the active rules
             in_phrase = True
         else:
             # Ongoing phrase

@@ -4,7 +4,7 @@
 # Licensed under the AGPL-3.0; see LICENSE.txt file.
 #
 
-import os, re, shutil
+import glob, os, re, shutil
 from io import open
 
 from six import PY2, text_type
@@ -12,7 +12,7 @@ from six import PY2, text_type
 from . import _log, KaldiError, REQUIRED_MODEL_VERSION
 from .wfst import SymbolTable
 from .wrapper import KaldiModelBuildUtils
-from .utils import ExternalProcess, find_file, load_symbol_table, show_donation_message, symbol_table_lookup
+from .utils import ExternalProcess, find_file, load_symbol_table, show_donation_message
 import kaldi_active_grammar.defaults as defaults
 import kaldi_active_grammar.utils as utils
 
@@ -179,7 +179,8 @@ class Lexicon(object):
 ########################################################################################################################
 
 class Model(object):
-    def __init__(self, model_dir=None, tmp_dir=None, tmp_dir_needed=False):
+    def __init__(self, model_dir=None, tmp_dir=None, tmp_dir_needed=False,
+            strict_content_validation=False, invalidate=False):
         show_donation_message()
 
         self.model_dir = os.path.join(model_dir or defaults.DEFAULT_MODEL_DIR, '')
@@ -212,7 +213,7 @@ class Model(object):
         self.create_missing_files()
         self.check_user_lexicon()
 
-        self.files_dict = {
+        primary_files = {
             'exec_dir': self.exec_dir,
             'model_dir': self.model_dir,
             'tmp_dir': self.tmp_dir,
@@ -225,7 +226,6 @@ class Model(object):
             'L_disambig.fst': find_file(self.model_dir, 'L_disambig.fst', default=True),
             'tree': find_file(self.model_dir, 'tree', default=True),
             'final.mdl': find_file(self.model_dir, 'final.mdl', default=True),
-            # 'g.irelabel': find_file(self.model_dir, 'g.irelabel', default=True),  # otf
             'user_lexicon.txt': find_file(self.model_dir, 'user_lexicon.txt', default=True),
             'left_context_phones.txt': find_file(self.model_dir, 'left_context_phones.txt', default=True),
             'nonterminals.txt': find_file(self.model_dir, 'nonterminals.txt', default=True),
@@ -233,34 +233,87 @@ class Model(object):
             'wdisambig_words.int': find_file(self.model_dir, 'wdisambig_words.int', default=True),
             'lexiconp_disambig.txt': find_file(self.model_dir, 'lexiconp_disambig.txt', default=True),
             'lexiconp_disambig.base.txt': find_file(self.model_dir, 'lexiconp_disambig.base.txt', default=True),
+            # 'g.irelabel': find_file(self.model_dir, 'g.irelabel', default=True),  # OTF only
+            # Present only in lookahead (LAF) model bundles.
+            'relabel_ilabels.int': find_file(self.model_dir, 'relabel_ilabels.int'),
             'words.relabeled.txt': find_file(self.model_dir, 'words.relabeled.txt', default=True),
         }
-        self.files_dict.update({ k.replace('.', '_'): v for (k, v) in self.files_dict.items() })  # For named placeholder access in str.format()
-        self.fst_cache = utils.FSTFileCache(os.path.join(self.model_dir, defaults.FILE_CACHE_FILENAME), dependencies_dict=self.files_dict, tmp_dir=self.tmp_dir)
+        dependency_files = {
+            name: path for name, path in primary_files.items()
+            if name not in {'exec_dir', 'model_dir', 'tmp_dir'}
+            and path is not None
+        }
+        self.files_dict = dict(primary_files)
+        self.files_dict.update({
+            name.replace('.', '_'): path for name, path in primary_files.items()
+        })  # For named placeholder access in str.format()
+        self._fst_cache = utils._FSTFileCache(
+            os.path.join(self.model_dir, defaults.FILE_CACHE_FILENAME),
+            dependencies_dict=dependency_files,
+            tmp_dir=self.tmp_dir,
+            invalidate=invalidate,
+            strict_content_validation=strict_content_validation,
+            defer_initial_save=True,
+        )
 
-        self.phone_to_int_dict = { phone: i for phone, i in load_symbol_table(self.files_dict['phones.txt']) }
-        self.lexicon = Lexicon(self.phone_to_int_dict.keys())
-        self.nonterm_phones_offset = self.phone_to_int_dict.get('#nonterm_bos')
-        if self.nonterm_phones_offset is None: raise KaldiError("missing nonterms in 'phones.txt'")
-        self.nonterm_words_offset = symbol_table_lookup(self.files_dict['words.base.txt'], '#nonterm_begin')
-        if self.nonterm_words_offset is None: raise KaldiError("missing nonterms in 'words.base.txt'")
+        # Only a reset cache (``cache_is_new``) is kept cold on disk until every
+        # generated file and the word table load successfully; a failed rebuild
+        # must retry on the next startup.  A warm cache is not proactively
+        # marked incomplete: most warm constructions preserve the generated
+        # files, and an unrelated read failure should not discard a valid cache.
+        # If warm construction does create a missing optional file, the
+        # unchanged on-disk dependency record will detect that file on reload.
+        # The transaction withholds every commit below until initialization
+        # completes.
+        with self._fst_cache._transaction():
+            self.phone_to_int_dict = { phone: i for phone, i in load_symbol_table(self.files_dict['phones.txt']) }
+            self.lexicon = Lexicon(self.phone_to_int_dict.keys())
+            self.nonterm_phones_offset = self.phone_to_int_dict.get('#nonterm_bos')
+            if self.nonterm_phones_offset is None: raise KaldiError("missing nonterms in 'phones.txt'")
 
-        # Update files if needed, before loading words
-        necessary_files = ['user_lexicon.txt', 'words.txt',]
-        non_lazy_files = ['align_lexicon.int', 'lexiconp_disambig.txt', 'L_disambig.fst',]
-        files_are_not_current = lambda files: any(not self.fst_cache.file_is_current(self.files_dict[file]) for file in files)
-        if self.fst_cache.cache_is_new or files_are_not_current(necessary_files + non_lazy_files):
-            self.generate_lexicon_files()
+            # Update files if needed, before loading words
+            if self._fst_cache.cache_is_new:
+                self.generate_lexicon_files()
 
-        self.words_table = SymbolTable()
-        self.load_words()
+            # Generate ``words.relabeled.txt`` if it is missing and ``relabel_ilabels.int`` is present (LAF model bundle).
+            if (not os.path.isfile(self.files_dict['words.relabeled.txt'])
+                    and self.files_dict['relabel_ilabels.int'] is not None):
+                _log.info("generating missing words.relabeled.txt from relabel_ilabels.int")
+                try:
+                    self.generate_words_relabeled_file(
+                        self.files_dict['words.txt'],
+                        self.files_dict['relabel_ilabels.int'],
+                        self.files_dict['words.relabeled.txt'])
+                except BaseException:
+                    # A replaceable non-atomic generator may have written a
+                    # partial destination. Do not let it suppress the retry.
+                    try:
+                        os.remove(self.files_dict['words.relabeled.txt'])
+                    except OSError:
+                        pass
+                    raise
+                # This dependency did not exist when the cache was initialized;
+                # record it now so the next startup can use the warm cache.
+                self._fst_cache.update_dependencies()
+                self._fst_cache.save()
+
+            self.words_table = SymbolTable()
+            self.load_words()
 
     def load_words(self, words_file=None):
         if words_file is None: words_file = self.files_dict['words.txt']
         _log.debug("loading words from %r", words_file)
-        invalid_words = "<eps> !SIL <UNK> #0 <s> </s>".lower().split()
         self.words_table.load_text_file(words_file)
-        self.longest_word = max(self.words_table.word_to_id_map.keys(), key=len)
+        nonterm_words_offset = self.words_table.word_to_id_map.get('#nonterm_begin')
+        if nonterm_words_offset is None:
+            raise KaldiError("missing nonterms in %r" % words_file)
+        previous_offset = getattr(self, 'nonterm_words_offset', nonterm_words_offset)
+        if previous_offset != nonterm_words_offset:
+            raise KaldiError(
+                "nonterminal offset mismatch: base table has %d but %r has %d"
+                % (previous_offset, words_file, nonterm_words_offset))
+        self.nonterm_words_offset = nonterm_words_offset
+        self.longest_word = self.words_table.longest_word
         return self.words_table
 
     def read_user_lexicon(self, filename=None):
@@ -315,7 +368,9 @@ class Model(object):
         return [phones]
 
     def create_missing_files(self):
-        utils.touch_file(os.path.join(self.model_dir, 'user_lexicon.txt'))
+        user_lexicon_filename = os.path.join(self.model_dir, 'user_lexicon.txt')
+        if not os.path.exists(user_lexicon_filename):
+            utils.touch_file(user_lexicon_filename)
         def check_file(filename, src_filename):
             # Create missing file from its base file
             if not find_file(self.model_dir, filename):
@@ -340,13 +395,49 @@ class Model(object):
                 entries = model_user_lexicon_entries + new_user_lexicon_entries
                 self.write_user_lexicon(entries, filename=model_user_lexicon_filename)
 
+    @staticmethod
+    def _read_base_word_info(base_words_file):
+        """Return ``(max terminal ID, nonterminal offset)`` in one pass."""
+        max_word_id = -1
+        nonterm_words_offset = None
+        with open(base_words_file, 'r', encoding='utf-8') as base_words:
+            for line_number, line in enumerate(base_words, 1):
+                tokens = line.split()
+                if len(tokens) != 2:
+                    raise KaldiError(
+                        "invalid symbol table entry in %r at line %d"
+                        % (base_words_file, line_number))
+                word, word_id_text = tokens
+                try:
+                    word_id = int(word_id_text)
+                except ValueError:
+                    raise KaldiError(
+                        "invalid symbol ID in %r at line %d: %r"
+                        % (base_words_file, line_number, word_id_text))
+                if word == '#nonterm_begin':
+                    nonterm_words_offset = word_id
+                if not word.startswith('#nonterm'):
+                    max_word_id = max(max_word_id, word_id)
+
+        if nonterm_words_offset is None:
+            raise KaldiError("missing nonterms in %r" % base_words_file)
+        if max_word_id < 0:
+            raise KaldiError("no terminal words in %r" % base_words_file)
+        return max_word_id, nonterm_words_offset
+
     def generate_lexicon_files(self):
         """ Generates: words.txt, align_lexicon.int, lexiconp_disambig.txt, L_disambig.fst """
         _log.info("generating lexicon files")
-        self.fst_cache.invalidate()
+        self._clear_cached_fsts()
 
-        # FIXME: refactor this to use words_table/SymbolTable
-        max_word_id = max(word_id for word, word_id in load_symbol_table(base_filepath(self.files_dict['words.txt'])) if word_id < self.nonterm_words_offset)
+        base_words_file = base_filepath(self.files_dict['words.txt'])
+        max_word_id, nonterm_words_offset = self._read_base_word_info(base_words_file)
+        previous_offset = getattr(self, 'nonterm_words_offset', nonterm_words_offset)
+        if previous_offset != nonterm_words_offset:
+            raise KaldiError(
+                "nonterminal offset mismatch: model has %d but base table has %d"
+                % (previous_offset, nonterm_words_offset))
+        self.nonterm_words_offset = nonterm_words_offset
 
         user_lexicon_entries = []
         with open(self.files_dict['user_lexicon.txt'], 'r', encoding='utf-8') as user_lexicon:
@@ -416,10 +507,17 @@ class Model(object):
             command |= self.files_dict['L_disambig.fst']
             command()
 
-        # FIXME: generate_words_relabeled_file(self.files_dict['words.txt'], self.files_dict['relabel_ilabels.int'], self.files_dict['words.relabeled.txt'])
+        self._fst_cache.update_dependencies()
+        # During Model construction, save() is deferred until the surrounding
+        # transaction confirms that all initialization steps completed.
+        self._fst_cache.save()
 
-        self.fst_cache.update_dependencies()
-        self.fst_cache.save()
+    def _clear_cached_fsts(self):
+        """Remove compiled grammar FSTs without changing dependency state."""
+        if self.tmp_dir is None:
+            return
+        for filename in glob.glob(os.path.join(self.tmp_dir, '*.fst')):
+            os.remove(filename)
 
     def reset_user_lexicon(self):
         utils.clear_file(self.files_dict['user_lexicon.txt'])
@@ -438,9 +536,14 @@ class Model(object):
             _log.warning("generate_words_relabeled_file: word_ids < relabel_from_ids")
         # if word_ids > relabel_from_ids:
         #     _log.warning("generate_words_relabeled_file: word_ids > relabel_from_ids")
-        with open(words_relabel_filename, 'w', encoding='utf-8') as file:
+        def write_relabeled_file(file):
             for (word, id) in word_id_pairs:
                 file.write("%s %s\n" % (word, (relabel_map.get(id, id))))
+
+        utils._atomic_write_text(
+            words_relabel_filename,
+            write_relabeled_file,
+            prefix='.words.relabeled.')
 
 
 ########################################################################################################################
@@ -499,9 +602,8 @@ def convert_generic_model_to_agf(src_dir, model_dir):
     with open(os.path.join(model_dir, 'nonterminals.txt'), 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(nonterm + '\n' for nonterm in nonterminals)
 
-    # add nonterminals to align_lexicon.int
-    
-    # fix L_disambig.fst: construct lexiconp_disambig.txt ...
+    # FIXME: add nonterminals to align_lexicon.int
+    # FIXME: fix L_disambig.fst: construct lexiconp_disambig.txt ...
 
 
 ########################################################################################################################

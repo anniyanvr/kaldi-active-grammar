@@ -24,39 +24,12 @@ set(LIBRARIES
   src/lib/libkaldi-dragonfly${CMAKE_SHARED_LIBRARY_SUFFIX}
   )
 
-# For MacOS, we handle all the "indirect" shared libraries manually.
-if("${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Darwin")
-  list(APPEND LIBRARIES
-    tools/openfst/lib/libfst${CMAKE_SHARED_LIBRARY_SUFFIX}
-    tools/openfst/lib/libfstscript${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-base${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-chain${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-cudamatrix${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-decoder${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-feat${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-fstext${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-gmm${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-hmm${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-ivector${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-lat${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-lm${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-matrix${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-nnet2${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-nnet3${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-online2${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-rnnlm${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-transform${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-tree${CMAKE_SHARED_LIBRARY_SUFFIX}
-    src/lib/libkaldi-util${CMAKE_SHARED_LIBRARY_SUFFIX}
-  )
-endif()
-
 if("${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Windows")
   message(FATAL_ERROR "CMake build not supported on Windows")
   # FIXME: copy files?
   # https://cmake.org/cmake/help/latest/command/foreach.html
   # https://stackoverflow.com/questions/34799916/copy-file-from-source-directory-to-binary-directory-using-cmake
-endif()  
+endif()
 
 find_program(MAKE_EXE NAMES make gmake nmake)
 
@@ -65,21 +38,41 @@ if(DEFINED ENV{INTEL_MKL_DIR})
   message("Compiling with MKL in: $ENV{INTEL_MKL_DIR}")
   set(KALDI_CONFIG_FLAGS --shared --static-math --use-cuda=no --mathlib=MKL --mkl-root=$ENV{INTEL_MKL_DIR})
   set(MATHLIB_BUILD_COMMAND true)
-else()  
-  message("Compiling with OpenBLAS")
-  set(KALDI_CONFIG_FLAGS --shared --static-math --use-cuda=no --mathlib=OPENBLAS)
-  set(MATHLIB_BUILD_COMMAND cd tools
-    && git clone -b v0.3.13 --single-branch https://github.com/xianyi/OpenBLAS
-    && ${MAKE_EXE} ${MAKE_FLAGS} -C OpenBLAS DYNAMIC_ARCH=1 TARGET=GENERIC USE_LOCKING=1 USE_THREAD=0 all
-    && ${MAKE_EXE} ${MAKE_FLAGS} -C OpenBLAS PREFIX=install install
-    && cd ..)
+else()
+  if("${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Darwin")
+    # Kaldi's configure dispatches on platform before it reads --mathlib, and
+    # its Darwin branch always uses Accelerate, so no OpenBLAS build or
+    # --mathlib flag is needed here. Note that configure still logs a mathlib
+    # it will not use: with --mathlib absent it auto-defaults on uname -m, so
+    # Intel logs MKL and arm64 logs OPENBLAS. The Darwin branch discards both.
+    # --static-math is likewise inert on Darwin, and is kept only to match the
+    # other config flag sets.
+    set(KALDI_CONFIG_FLAGS --shared --static-math --use-cuda=no)
+    set(MATHLIB_BUILD_COMMAND true)
+  else()
+    if(NOT DEFINED OPENBLAS_REF)
+      set(OPENBLAS_REF "v0.3.34")
+    endif()
+    message("Compiling with OpenBLAS git ref: ${OPENBLAS_REF}")
+    set(KALDI_CONFIG_FLAGS --shared --static-math --use-cuda=no --mathlib=OPENBLAS)
+    set(OPENBLAS_MAKE_OPTIONS DYNAMIC_ARCH=1 TARGET=GENERIC USE_LOCKING=1 USE_THREAD=0)
+    set(MATHLIB_BUILD_COMMAND cd tools
+      && git clone -b ${OPENBLAS_REF} --single-branch https://github.com/OpenMathLib/OpenBLAS
+      && ${MAKE_EXE} ${MAKE_FLAGS} -C OpenBLAS ${OPENBLAS_MAKE_OPTIONS} all
+      && ${MAKE_EXE} ${MAKE_FLAGS} -C OpenBLAS ${OPENBLAS_MAKE_OPTIONS} PREFIX=install install
+      && cd ..)
+  endif()
 endif()
 
-if(DEFINED ENV{KALDI_BRANCH})
-  set(KALDI_BRANCH $ENV{KALDI_BRANCH})
+if(DEFINED ENV{KALDI_REVISION})
+  set(KALDI_REVISION $ENV{KALDI_REVISION})
 else()
-  message(FATAL_ERROR "KALDI_BRANCH not set! Use 'origin/master'?")
-  # set(KALDI_BRANCH "origin/master")
+  file(READ "${PROJECT_SOURCE_DIR}/kaldi-native-revision.txt" KALDI_REVISION)
+  string(STRIP "${KALDI_REVISION}" KALDI_REVISION)
+endif()
+string(LENGTH "${KALDI_REVISION}" KALDI_REVISION_LENGTH)
+if(NOT KALDI_REVISION MATCHES "^[0-9a-f]+$" OR NOT KALDI_REVISION_LENGTH EQUAL 40)
+  message(FATAL_ERROR "KALDI_REVISION must be a full, lowercase 40-character Git commit hash")
 endif()
 
 message("MAKE_EXE                  = ${MAKE_EXE}")
@@ -88,7 +81,7 @@ message("PYTHON_INCLUDE_DIR        = ${PYTHON_INCLUDE_DIR}")
 message("PYTHON_LIBRARY            = ${PYTHON_LIBRARY}")
 message("PYTHON_VERSION_STRING     = ${PYTHON_VERSION_STRING}")
 message("SKBUILD                   = ${SKBUILD}")
-message("KALDI_BRANCH              = ${KALDI_BRANCH}")
+message("KALDI_REVISION            = ${KALDI_REVISION}")
 message("CMAKE_CURRENT_SOURCE_DIR  = ${CMAKE_CURRENT_SOURCE_DIR}")
 message("CMAKE_CURRENT_BINARY_DIR  = ${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -104,55 +97,15 @@ if(NOT "${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Windows")
   # set(STRIP_LIBS_COMMAND true)
   set(STRIP_DST_COMMAND true)
   ExternalProject_Add(kaldi
-    GIT_CONFIG        advice.detachedHead=false
-    GIT_REPOSITORY    https://github.com/daanzu/kaldi-fork-active-grammar.git
-    GIT_TAG           ${KALDI_BRANCH}
-    GIT_SHALLOW       TRUE
+    DOWNLOAD_COMMAND  ${PROJECT_SOURCE_DIR}/building/checkout-kaldi.sh <SOURCE_DIR> https://github.com/daanzu/kaldi-fork-active-grammar.git ${KALDI_REVISION}
+    UPDATE_COMMAND    ""
+    STEP_TARGETS      download
     CONFIGURE_COMMAND sed -i.bak -e "s/status=0/exit 0/g" tools/extras/check_dependencies.sh && sed -i.bak -e "s/openfst_add_CXXFLAGS = -g -O2/openfst_add_CXXFLAGS = -g0 -O3/g" tools/Makefile && cp ${PROJECT_SOURCE_DIR}/building/kaldi-configure-wrapper.sh src/
     BUILD_IN_SOURCE   TRUE
-    BUILD_COMMAND     ${MATHLIB_BUILD_COMMAND} && cd tools && ${MAKE_EXE} ${MAKE_FLAGS} && cd openfst && autoreconf && cd ../../src && bash ./kaldi-configure-wrapper.sh ./configure ${KALDI_CONFIG_FLAGS} && ${MAKE_EXE} ${MAKE_FLAGS} depend && ${MAKE_EXE} ${MAKE_FLAGS} dragonfly
+    BUILD_COMMAND     ${MATHLIB_BUILD_COMMAND} && cd tools && ${MAKE_EXE} && cd openfst && autoreconf && cd ../../src && bash ./kaldi-configure-wrapper.sh ./configure ${KALDI_CONFIG_FLAGS} && ${MAKE_EXE} ${MAKE_FLAGS} depend && ${MAKE_EXE} ${MAKE_FLAGS} dragonfly
     LIST_SEPARATOR    " "
     INSTALL_COMMAND   ${STRIP_LIBS_COMMAND} && mkdir -p ${DST} && cp ${BINARIES} ${LIBRARIES} ${DST} && ${STRIP_DST_COMMAND}
     )
-endif()
-
-# Fix dynamic libraries loading paths on macOS.  The libraries and
-# executables are built with RPATH settings embedded in them, pointing
-# to the locations in temporary directories used to build the
-# binaries.  After package installation is done, these directories are
-# deleted and the dynamic libraries cannot be loaded.  The following
-# commands generate a shell script that fixes the paths to the dynamic
-# libraries in the built executables and the libraries themselves.
-# Also the commands add a custom target to invoke the generated script
-# after the external project (kaldi) has been built.  An alternative
-# would be to change the kaldi engine build system to accept a path to
-# where the binaries would be placed and point RPATH to that location.
-if("${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Darwin")
-  string (REPLACE ";" " " BINARIES_STR "${BINARIES}")
-  string (REPLACE ";" " " LIBRARIES_STR "${LIBRARIES}")
-  file(GENERATE OUTPUT name_fixer
-    CONTENT
-    "for a in ${BINARIES_STR} ; do
-       a_bare=$\{a##*/\}
-       install_name_tool -change ${PROJECT_BINARY_DIR}/kaldi-prefix/src/kaldi/tools/openfst-1.6.7/lib/libfst.10.dylib \"@loader_path/libfst.dylib\" ${DST}$a_bare
-       install_name_tool -change ${PROJECT_BINARY_DIR}/kaldi-prefix/src/kaldi/tools/openfst-1.6.7/lib/libfstscript.10.dylib \"@loader_path/libfstscript.dylib\" ${DST}$a_bare
-       for b in ${LIBRARIES_STR} ; do
-          b_bare=$\{b##*/\}
-         install_name_tool -change \"@rpath/$b_bare\" \"@loader_path/$b_bare\" ${DST}$a_bare
-       done
-     done
-     for a in ${LIBRARIES_STR} ; do
-       a_bare=$\{a##*/\}
-       install_name_tool -id \"@loader_path/$a_bare\" ${DST}$a_bare
-       install_name_tool -change ${PROJECT_BINARY_DIR}/kaldi-prefix/src/kaldi/tools/openfst-1.6.7/lib/libfst.10.dylib \"@loader_path/libfst.dylib\" ${DST}$a_bare
-       install_name_tool -change ${PROJECT_BINARY_DIR}/kaldi-prefix/src/kaldi/tools/openfst-1.6.7/lib/libfstscript.10.dylib \"@loader_path/libfstscript.dylib\" ${DST}$a_bare
-       for b in ${LIBRARIES_STR} ; do
-          b_bare=$\{b##*/\}
-         install_name_tool -change \"@rpath/$b_bare\" \"@loader_path/$b_bare\" ${DST}$a_bare
-       done
-     done")
-  add_custom_target(fixer ALL COMMAND /bin/sh name_fixer)
-  add_dependencies(fixer kaldi)
 endif()
 
 install(CODE "MESSAGE(\"Installed kaldi engine binaries.\")")
